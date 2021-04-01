@@ -1,173 +1,62 @@
 module("luci.controller.filebrowser", package.seeall)
+--local fs=require"nixio.fs"
+local http = require "luci.http"
+local api = require "luci.model.cbi.filebrowser.api"
+--local uci=require"luci.model.uci".cursor()
 
 function index()
-
-	page = entry({"admin", "system", "filebrowser"}, template("filebrowser"), _("File Browser"), 60)
-	page.i18n = "base"
-	page.dependent = true
-
-	page = entry({"admin", "system", "filebrowser_list"}, call("filebrowser_list"), nil)
-	page.leaf = true
-
-	page = entry({"admin", "system", "filebrowser_open"}, call("filebrowser_open"), nil)
-	page.leaf = true
-
-    page = entry({"admin", "system", "filebrowser_delete"}, call("filebrowser_delete"), nil)
-    page.leaf = true
-
-    page = entry({"admin", "system", "filebrowser_rename"}, call("filebrowser_rename"), nil)
-    page.leaf = true
-
-    page = entry({"admin", "system", "filebrowser_upload"}, call("filebrowser_upload"), nil)
-    page.leaf = true
-
-end
-
-function filebrowser_list()
-	local rv = { }
-	local path = luci.http.formvalue("path")
-
-    rv = scandir(path)	
-
-	if #rv > 0 then
-		luci.http.prepare_content("application/json")
-		luci.http.write_json(rv)
+	if not nixio.fs.access("/etc/config/filebrowser") then
 		return
 	end
-
+	entry({"admin", "nas"}, firstchild(), _("NAS") , 44).dependent = false
+	entry({"admin", "nas", "filebrowser"}, cbi("filebrowser/settings"), _("File Browser"), 2).dependent = true
+	entry({"admin", "nas", "filebrowser", "check"}, call("action_check")).leaf = true
+	entry({"admin", "nas", "filebrowser", "download"}, call("action_download")).leaf = true
+	entry({"admin", "nas", "filebrowser", "status"}, call("act_status")).leaf = true
+	entry({"admin", "nas", "filebrowser", "get_log"}, call("get_log")).leaf = true
+	entry({"admin", "nas", "filebrowser", "clear_log"}, call("clear_log")).leaf = true
+	--local page
+	--page = entry({"admin", "nas", "filebrowser"}, cbi("filebrowser"), _("File Browser"), 100).dependent = true
+	--entry({"admin","nas","filebrowser","status"},call("act_status")).leaf=true
 end
 
-function filebrowser_open(file, filename)
-	file = file:gsub("<>", "/")
-
-	local io = require "io"
-	local mime = to_mime(filename)
-
-	local download_fpi = io.open(file, "r")
-	luci.http.header('Content-Disposition', 'inline; filename="'..filename..'"' )
-	luci.http.prepare_content(mime or "application/octet-stream")
-	luci.ltn12.pump.all(luci.ltn12.source.file(download_fpi), luci.http.write)
+local function http_write_json(content)
+	http.prepare_content("application/json")
+	http.write_json(content or {code = 1})
 end
 
-function filebrowser_delete()
-    local path = luci.http.formvalue("path")
-    local isdir = luci.http.formvalue("isdir")
-    path = path:gsub("<>", "/")
-    path = path:gsub(" ", "\ ")
-    if isdir then
-        local success = os.execute('rm -r "'..path..'"')
+function act_status()
+	local e={}
+	--e.running=luci.sys.call("pgrep filebrowser >/dev/null")==0
+	-- e.port=luci.sys.exec("uci get filebrowser.config.port")
+	--luci.http.prepare_content("application/json")
+	e.status = luci.sys.call("ps -w | grep -v grep | grep 'filebrowser -a' >/dev/null") == 0
+	luci.http.write_json(e)
+end
+
+function action_check()
+	local json = api.to_check()
+	http_write_json(json)
+end
+
+function action_download()
+    local json = nil
+    local task = http.formvalue("task")
+    if task == "extract" then
+        json = api.to_extract(http.formvalue("file"))
+    elseif task == "move" then
+        json = api.to_move(http.formvalue("file"))
     else
-        local success = os.remove(path)
+        json = api.to_download(http.formvalue("url"))
     end
-    return success
+    http_write_json(json)
 end
 
-function filebrowser_rename()
-    local filepath = luci.http.formvalue("filepath")
-    local newpath = luci.http.formvalue("newpath")
-    local success = os.execute('mv "'..filepath..'" "'..newpath..'"')
-    return success
+function get_log()
+    luci.http.write(luci.sys.exec("[ -f '/var/log/filebrowser.log' ] && cat /var/log/filebrowser.log"))
 end
 
-function filebrowser_upload()
-    local filecontent = luci.http.formvalue("upload-file")
-    local filename = luci.http.formvalue("upload-filename")
-    local uploaddir = luci.http.formvalue("upload-dir")
-    local filepath = uploaddir..filename
-    local url = luci.dispatcher.build_url('admin', 'system', 'filebrowser')
-
-    local fp
-    fp = io.open(filepath, "w")
-    fp:write(filecontent)
-    fp:close()
-    luci.http.redirect(url..'?path='..uploaddir)
-
-    --[[luci.http.setfilehandler(
-        function(meta, chunk, eof)
-            uci.http.write('open '..filepath)
-            if not fp then
-                if meta and meta.name == 'upload-file' then
-                    --luci.http.write('open file '..filepath)
-                    fp = io.open(filepath, "w")
-                end
-            end
-            if fp and chunk then
-                --luci.http.write(chunk)
-                fp:write(chunk)
-            end
-            if fp and eof then
-                --luci.http.write('close')
-                fp:close()
-                luci.http.redirect(url..'?path='..uploaddir)
-            end
-        end
-    )]]--
+function clear_log()
+	luci.sys.call("echo '' > /var/log/filebrowser.log") 
 end
-
-function scandir(directory)
-    local i, t, popen = 0, {}, io.popen
-    
-    local pfile = popen("ls -l \""..directory.."\" | egrep '^d' ; ls -lh \""..directory.."\" | egrep -v '^d'")
-    for filename in pfile:lines() do
-        i = i + 1
-        t[i] = filename
-    end
-    pfile:close()
-    return t
-end
-
-MIME_TYPES = {
-    ["txt"]   = "text/plain";
-    ["js"]    = "text/javascript";
-    ["css"]   = "text/css";
-    ["htm"]   = "text/html";
-    ["html"]  = "text/html";
-    ["patch"] = "text/x-patch";
-    ["c"]     = "text/x-csrc";
-    ["h"]     = "text/x-chdr";
-    ["o"]     = "text/x-object";
-    ["ko"]    = "text/x-object";
-
-    ["bmp"]   = "image/bmp";
-    ["gif"]   = "image/gif";
-    ["png"]   = "image/png";
-    ["jpg"]   = "image/jpeg";
-    ["jpeg"]  = "image/jpeg";
-    ["svg"]   = "image/svg+xml";
-
-    ["zip"]   = "application/zip";
-    ["pdf"]   = "application/pdf";
-    ["xml"]   = "application/xml";
-    ["xsl"]   = "application/xml";
-    ["doc"]   = "application/msword";
-    ["ppt"]   = "application/vnd.ms-powerpoint";
-    ["xls"]   = "application/vnd.ms-excel";
-    ["odt"]   = "application/vnd.oasis.opendocument.text";
-    ["odp"]   = "application/vnd.oasis.opendocument.presentation";
-    ["pl"]    = "application/x-perl";
-    ["sh"]    = "application/x-shellscript";
-    ["php"]   = "application/x-php";
-    ["deb"]   = "application/x-deb";
-    ["iso"]   = "application/x-cd-image";
-    ["tgz"]   = "application/x-compressed-tar";
-
-    ["mp3"]   = "audio/mpeg";
-    ["ogg"]   = "audio/x-vorbis+ogg";
-    ["wav"]   = "audio/x-wav";
-
-    ["mpg"]   = "video/mpeg";
-    ["mpeg"]  = "video/mpeg";
-    ["avi"]   = "video/x-msvideo";
-}
-
-function to_mime(filename)
-	if type(filename) == "string" then
-		local ext = filename:match("[^%.]+$")
-
-		if ext and MIME_TYPES[ext:lower()] then
-			return MIME_TYPES[ext:lower()]
-		end
-	end
-
-	return "application/octet-stream"
-end
+	
